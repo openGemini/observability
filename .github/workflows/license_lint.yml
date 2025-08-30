@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: skip generated files and dot folders
-        run: rm -rf proto/*.pb.go
+        run: rm -rf trace/{proto,gen}
       - name: licenselint
         uses: hezhangjian/licenselint@main
         with:

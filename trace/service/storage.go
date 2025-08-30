@@ -1,3 +1,17 @@
+// Copyright 2024 openGemini Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package service
 
 import (
@@ -6,19 +20,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/openGemini/observability/trace/gen/jaeger_storage/v2"
-	collectortrace "github.com/openGemini/observability/trace/gen/otlp/collector/trace/v1"
 	"github.com/openGemini/opengemini-client-go/opengemini"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	otlpcommonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	otlpresourcev1 "go.opentelemetry.io/proto/otlp/resource/v1"
 	otlptracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/grpc"
+
+	"github.com/openGemini/observability/trace/gen/jaeger_storage/v2"
+	collectortrace "github.com/openGemini/observability/trace/gen/otlp/collector/trace/v1"
 )
 
 const (
@@ -35,6 +52,12 @@ const (
 	EndTimeUnixNano   = "end_time_unix_ns"
 	DurationNano      = "duration_ns"
 	ProcessTags       = "process_tags"
+	SchemaUrl         = "schema_url"
+)
+
+const (
+	LogTypeJson = "json"
+	LogTypeText = "text"
 )
 
 var (
@@ -47,6 +70,7 @@ var (
 type OpenGeminiStorage struct {
 	client opengemini.Client
 	config *Config
+	logger *slog.Logger
 }
 
 // getAnyValue convert OTLP AttributeValue to raw value
@@ -143,7 +167,7 @@ func (o *OpenGeminiStorage) convertSpanToPoint(resource *otlpresourcev1.Resource
 	if span.SpanId != nil {
 		point.Fields[SpanID] = hex.EncodeToString(span.SpanId)
 	}
-	if span.ParentSpanId != nil && len(span.ParentSpanId) > 0 {
+	if len(span.ParentSpanId) > 0 {
 		point.Fields[ParentSpanID] = hex.EncodeToString(span.ParentSpanId)
 	}
 	if span.Name != "" {
@@ -191,39 +215,29 @@ func (o *OpenGeminiStorage) convertSpanToPoint(resource *otlpresourcev1.Resource
 	return point
 }
 
+// Export [grpc] push span to openGemini server between one Application instrumented with
+// OpenTelemetry and a collector, or between a collector and a central collector
 func (o *OpenGeminiStorage) Export(ctx context.Context, request *collectortrace.ExportTraceServiceRequest) (*collectortrace.ExportTraceServiceResponse, error) {
-	content, err := json.Marshal(request)
-	if err != nil {
-		return nil, err
-	}
-	fmt.Println(string(content))
-
 	var points []*opengemini.Point
-
-	// 遍历所有ResourceSpans
 	for _, resourceSpan := range request.ResourceSpans {
 		resource := resourceSpan.GetResource()
-
-		// 遍历所有ScopeSpans
 		for _, scopeSpan := range resourceSpan.ScopeSpans {
 			scope := scopeSpan.GetScope()
-
-			// 遍历所有Spans
 			for _, span := range scopeSpan.Spans {
 				point := o.convertSpanToPoint(resource, scope, span)
+				point.Fields["schema_url"] = scopeSpan.SchemaUrl
 				points = append(points, point)
 			}
 		}
 	}
 
-	// 批量写入OpenGemini
 	if len(points) > 0 {
 		err := o.pushTraceData(ctx, points)
 		if err != nil {
-			slog.Error("failed to write points to OpenGemini", "reason", err, "points_count", len(points))
+			o.logger.Error("failed to write points to OpenGemini", "reason", err, "count", len(points))
 			return nil, err
 		}
-		slog.Info("successfully exported traces to OpenGemini", "points_count", len(points))
+		o.logger.Info("successfully exported traces to OpenGemini", "count", len(points))
 	}
 
 	var response = new(collectortrace.ExportTraceServiceResponse)
@@ -262,12 +276,30 @@ func (o *OpenGeminiStorage) Stop(ctx context.Context) error {
 	return nil
 }
 
+// UploadTraces [api] push span to openGemini server from rest api
 func (o *OpenGeminiStorage) UploadTraces(ctx context.Context, protoSpans []*otlptracev1.ResourceSpans) error {
-	content, err := json.Marshal(protoSpans)
-	if err != nil {
-		return err
+	var points []*opengemini.Point
+	for _, resourceSpan := range protoSpans {
+		resource := resourceSpan.GetResource()
+		for _, scopeSpan := range resourceSpan.ScopeSpans {
+			scope := scopeSpan.GetScope()
+			for _, span := range scopeSpan.Spans {
+				point := o.convertSpanToPoint(resource, scope, span)
+				point.Fields["schema_url"] = scopeSpan.SchemaUrl
+				points = append(points, point)
+			}
+		}
 	}
-	fmt.Println("implement me, upload trace", string(content))
+
+	if len(points) > 0 {
+		err := o.pushTraceData(ctx, points)
+		if err != nil {
+			o.logger.Error("failed to write points to OpenGemini", "reason", err, "count", len(points))
+			return err
+		}
+		o.logger.Info("successfully exported traces to OpenGemini", "count", len(points))
+	}
+
 	return nil
 }
 
@@ -281,10 +313,33 @@ func NewOpenGeminiStorage(cfg *Config) (*OpenGeminiStorage, error) {
 		return nil, err
 	}
 	var engine = &OpenGeminiStorage{client: client, config: cfg}
+
+	var logOuts = []io.Writer{os.Stdout}
+	if cfg.Log != nil {
+		if cfg.Log.Output != "" {
+			// TODO file close
+			logFile, err := os.OpenFile(cfg.Log.Output, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
+			if err != nil {
+				slog.Error("failed to open log file", "reason", err, "file", cfg.Log.Output)
+				return nil, err
+			}
+			logOuts = append(logOuts, logFile)
+		}
+		multiWriter := io.MultiWriter(logOuts...)
+		switch cfg.Log.Type {
+		case LogTypeJson:
+			engine.logger = slog.New(slog.NewJSONHandler(multiWriter, &slog.HandlerOptions{Level: levelString2SlogLevel(cfg.Log.Level)}))
+		case LogTypeText:
+			fallthrough
+		default:
+			engine.logger = slog.New(slog.NewTextHandler(multiWriter, &slog.HandlerOptions{Level: levelString2SlogLevel(cfg.Log.Level)}))
+		}
+	}
+
 	// create database
 	err = client.CreateDatabase(cfg.Database)
 	if err != nil {
-		slog.Error("failed to create database", "database", cfg.Database, "reason", err)
+		engine.logger.Error("failed to create database", "database", cfg.Database, "reason", err)
 		return nil, err
 	}
 	// create retention policy
@@ -293,7 +348,7 @@ func NewOpenGeminiStorage(cfg *Config) (*OpenGeminiStorage, error) {
 		Duration: cfg.RetentionDuration,
 	}, true)
 	if err != nil {
-		slog.Error("failed to create retention policy", "database", cfg.Database, "rp", cfg.RetentionPolicy,
+		engine.logger.Error("failed to create retention policy", "database", cfg.Database, "rp", cfg.RetentionPolicy,
 			"duration", cfg.RetentionDuration, "reason", err)
 		return nil, err
 	}
@@ -345,46 +400,55 @@ func (o *OpenGeminiStorage) FindTraces(request *jaeger_storage.FindTracesRequest
 	var queryBuilder = opengemini.CreateQueryBuilder()
 	var query = request.GetQuery()
 	if query.ServiceName != "" {
-		queryBuilder.From(query.ServiceName)
+		queryBuilder = queryBuilder.From(query.ServiceName)
 	}
+	var conditions []opengemini.Condition
 	if query.OperationName != "" {
-		queryBuilder.Where(opengemini.NewComparisonCondition(OperationName, opengemini.Equals, query.OperationName))
+		conditions = append(conditions, opengemini.NewComparisonCondition(OperationName, opengemini.Equals, query.OperationName))
+	}
+	if query.StartTimeMin != nil && query.StartTimeMin.AsTime().UnixNano() != 0 {
+		duration := query.StartTimeMin.AsTime().UnixNano()
+		conditions = append(conditions, opengemini.NewComparisonCondition(StartTimeUnixNano, opengemini.GreaterThan, duration))
+	}
+	if query.StartTimeMax != nil && query.StartTimeMax.AsTime().UnixNano() != 0 {
+		duration := query.StartTimeMax.AsTime().UnixNano()
+		conditions = append(conditions, opengemini.NewComparisonCondition(EndTimeUnixNano, opengemini.LessThan, duration))
+	}
+	if query.DurationMin != nil && query.DurationMin.AsDuration().Nanoseconds() != 0 {
+		duration := query.DurationMin.AsDuration().Nanoseconds()
+		conditions = append(conditions, opengemini.NewComparisonCondition(DurationNano, opengemini.GreaterThan, duration))
+	}
+	if query.DurationMax != nil && query.DurationMax.AsDuration().Nanoseconds() != 0 {
+		duration := query.DurationMax.AsDuration().Nanoseconds()
+		conditions = append(conditions, opengemini.NewComparisonCondition(DurationNano, opengemini.LessThan, duration))
+	}
+	if len(conditions) != 0 {
+		queryBuilder = queryBuilder.Where(opengemini.NewCompositeCondition(opengemini.And, conditions...))
 	}
 	if query.SearchDepth != 0 {
 		queryBuilder.Limit(int64(query.SearchDepth))
 	}
-	if query.StartTimeMin != nil {
-		queryBuilder.Where(opengemini.NewComparisonCondition(StartTimeUnixNano, opengemini.GreaterThan, query.StartTimeMin.Nanos))
-	}
-	if query.StartTimeMax != nil {
-		queryBuilder.Where(opengemini.NewComparisonCondition(EndTimeUnixNano, opengemini.LessThan, query.StartTimeMax.Nanos))
-	}
-	if query.DurationMin != nil {
-		queryBuilder.Where(opengemini.NewComparisonCondition(DurationNano, opengemini.GreaterThan, query.DurationMin.Nanos))
-	}
-	if query.DurationMax != nil {
-		queryBuilder.Where(opengemini.NewComparisonCondition(DurationNano, opengemini.LessThan, query.DurationMax.Nanos))
-	}
-	var queryRaw = *queryBuilder.Build()
-	queryResult, err := o.client.Query(queryRaw)
+	var requestData = *queryBuilder.Build()
+	requestData.Database = o.config.Database
+	queryResult, err := o.client.Query(requestData)
 	if err != nil {
-		slog.Error("failed to find traces", "query", queryRaw.Command, "reason", err)
+		o.logger.Error("failed to find traces", "query", requestData.Command, "reason", err)
 		return err
 	}
 	if queryResult.Error != "" {
-		slog.Error("failed to find traces", "query", queryRaw.Command, "reason", queryResult.Error)
+		o.logger.Error("failed to find traces", "query", requestData.Command, "reason", queryResult.Error)
 		return errors.New(queryResult.Error)
 	}
 
 	traceData, err := o.convertTraceData(queryResult.Results)
 	if err != nil {
-		slog.Error("failed to convert traces", "query", queryRaw.Command, "reason", err)
+		o.logger.Error("failed to convert traces", "query", requestData.Command, "reason", err)
 		return err
 	}
 
 	err = g.Send(traceData)
 	if err != nil {
-		slog.Error("failed to send traces", "query", queryRaw.Command, "reason", err)
+		o.logger.Error("failed to send traces", "query", requestData.Command, "reason", err)
 		return err
 	}
 	return nil
@@ -393,11 +457,11 @@ func (o *OpenGeminiStorage) FindTraces(request *jaeger_storage.FindTracesRequest
 func (o *OpenGeminiStorage) convertTraceData(results []*opengemini.SeriesResult) (*otlptracev1.TracesData, error) {
 	var response = new(otlptracev1.TracesData)
 	if len(results) == 0 {
-		slog.Debug("no results to convert")
+		o.logger.Debug("no results to convert")
 		return response, nil
 	}
 
-	slog.Debug("converting trace data", "results_count", len(results))
+	o.logger.Debug("converting trace data", "results_count", len(results))
 
 	// 按trace_id分组spans
 	traceGroups := make(map[string][]*opengemini.SeriesResult)
@@ -938,12 +1002,23 @@ func (o *OpenGeminiStorage) parseStatusCode(statusCodeStr string) otlptracev1.St
 	}
 }
 
-func (o *OpenGeminiStorage) getFieldNames(columns []string) []string {
-	return columns
-}
-
 func (o *OpenGeminiStorage) FindTraceIDs(ctx context.Context, request *jaeger_storage.FindTracesRequest) (*jaeger_storage.FindTraceIDsResponse, error) {
 	//TODO implement me
 	slog.Error("FindTraceIDs called")
 	return &jaeger_storage.FindTraceIDsResponse{}, nil
+}
+
+func levelString2SlogLevel(level string) slog.Level {
+	switch strings.ToLower(level) {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }

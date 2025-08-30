@@ -4,9 +4,6 @@
 # ide
 .idea/**
 .vscode/**
-!.idea/icon.svg
-!.idea/vcs.xml
-
 target/*
 
 # Binaries for programs and plugins

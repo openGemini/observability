@@ -13,9 +13,9 @@
 
 ## Narrative
 
-| plugin name                        | function effect                          |
-|------------------------------------|------------------------------------------|
-| [storage/jaeger](storage/jaeger) | use openGemini as Jaeger storage backend |
+| plugin name       | function effect                          |
+|-------------------|------------------------------------------|
+| [ts-trace](trace) | use openGemini as Jaeger storage backend |
 
 ## About OpenGemini
 
